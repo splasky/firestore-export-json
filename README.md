@@ -88,6 +88,11 @@ e.g.
 python fs_to_json.py exports/all_namespaces/kind_collection-id out/collection-id
 ```
 
+Write the archives to postgres:
+```
+python fs_to_json.py ./2023-08-26T16:00:03.188835161Z . -pg -cstr "postgresql://postgres:mysecretpassword@localhost:5432/Datastore_bk"
+```
+
 ### Method 2
 
 The project exposes console script using setuptools to provide `fs_to_json` CLI command which can be used to convert exports to JSON.

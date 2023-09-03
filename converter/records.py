@@ -102,6 +102,9 @@ class RecordsReader(object):
             return ("", RECORD_TYPE_NONE)
 
         header = self.__reader.read(HEADER_LENGTH)
+        if len(header) == 0:
+            raise EOFError("End of file reached")
+
         if len(header) != HEADER_LENGTH:
             raise EOFError("Read %s bytes instead of %s" % (len(header), HEADER_LENGTH))
 

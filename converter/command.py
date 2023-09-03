@@ -8,16 +8,20 @@ from pathlib import Path
 from typing import Dict
 
 from google.appengine.api import datastore
-from google.appengine.api.datastore_types import EmbeddedEntity
+from google.appengine.api.datastore_types import EmbeddedEntity, GeoPt
 from google.appengine.datastore import entity_bytes_pb2 as entity_pb2
 
 from converter import records
 from converter.exceptions import BaseError, ValidationError
-from converter.utils import embedded_entity_to_dict, get_dest_dict, serialize_json
+from converter.utils import embedded_entity_to_dict, serialize_json
+
+import pandas as pd
+from sqlalchemy import create_engine, MetaData
+from sqlalchemy.dialects.postgresql import JSONB
 
 num_files: Value = Value("i", 0)
 num_files_processed: Value = Value("i", 0)
-
+except_table = ["spatial_ref_sys"]
 
 def main(args=None):
     if args is None:
@@ -69,6 +73,22 @@ def main(args=None):
         action="store_true",
     )
 
+    parser.add_argument(
+        "-pg",
+        "--write-to-postgres",
+        help="Write to postgres",
+        default=False,
+        action="store_true",
+    ) 
+
+    parser.add_argument(
+        "-cstr",
+        "--connection-string",
+        help="Postgres connection string",
+        default="postgresql://postgres:mysecretpassword@localhost:5432/Datastore",
+        type=str,
+    )
+
     args = parser.parse_args(args)
     try:
         source_dir = os.path.abspath(args.source_dir)
@@ -95,61 +115,146 @@ def main(args=None):
             dest_dir=dest_dir,
             num_processes=args.processes,
             no_check_crc=args.no_check_crc,
+            write_to_pg=args.write_to_postgres,
+            conn_str=args.connection_string,
         )
     except BaseError as e:
         print(str(e))
         sys.exit(1)
 
 
-def process_files(
-    source_dir: str, dest_dir: str, num_processes: int, no_check_crc: bool
-):
+def process_files(source_dir: str, dest_dir: str, num_processes: int, no_check_crc: bool, write_to_pg: bool, conn_str: str):
     p = Pool(num_processes)
-    files = sorted(os.listdir(source_dir))
+    files = []
+    if os.path.isdir(source_dir):
+        files = traverse_dir(source_dir)
+    else:
+        files = sorted(os.listdir(source_dir))
     num_files.value = len(files)
     print(f"processing {num_files.value} file(s)")
 
-    f = partial(process_file, source_dir, dest_dir, no_check_crc)
+    if write_to_pg:
+        drop_tables(create_engine(conn_str))
+
+    f = partial(process_file, source_dir, dest_dir, no_check_crc, write_to_pg, conn_str)
     p.map(f, files)
+    p.close()
+    p.join()
     print(
         f"processed: {num_files_processed.value}/{num_files.value} {num_files_processed.value/num_files.value*100}%"
     )
 
+def traverse_dir(source_dir: str):
+    outputs = []
+    for root, _, files in os.walk(source_dir):
+        for file in files:
+            if file.find("output-") == -1:
+                continue
+            outputs.append(os.path.abspath(os.path.join(root, file)))
+    return outputs
 
-def process_file(source_dir: str, dest_dir: str, no_check_crc: bool, filename: str):
-    if not filename.startswith("output-"):
+def process_file(source_dir: str, dest_dir: str, no_check_crc: bool, write_to_pg: bool, conn_str: str, filename: str):
+    if filename.find("output-") == -1:
         return
-    json_tree: Dict = {}
-    in_file = os.path.join(source_dir, filename)
 
-    with open(in_file, "rb") as raw:
-        reader = records.RecordsReader(raw, no_check_crc=no_check_crc)
-        for record in reader:
-            entity_proto = entity_pb2.EntityProto()
-            entity_proto.ParseFromString(record)
-            ds_entity = datastore.Entity.FromPb(entity_proto)
-            data = {}
-            for name, value in list(ds_entity.items()):
-                if isinstance(value, EmbeddedEntity):
-                    dt: Dict = {}
-                    data[name] = embedded_entity_to_dict(value, dt)
-                else:
-                    data[name] = value
+    in_file = filename 
+    table = ""
+    pg_dataframe = []
+    convert_dtype = {}
 
-            data_dict = get_dest_dict(ds_entity.key(), json_tree)
-            data_dict.update(data)
+    try:
+        with open(in_file, "rb") as raw:
+            reader = records.RecordsReader(raw, no_check_crc=no_check_crc)
+            for record in reader:
+                entity_proto = entity_pb2.EntityProto()
+                entity_proto.ParseFromString(record)
 
-    out_file_path = os.path.join(dest_dir, filename + ".json")
-    with open(out_file_path, "w", encoding="utf8") as out:
-        out.write(
-            json.dumps(json_tree, default=serialize_json, ensure_ascii=False, indent=2)
-        )
+                ds_entity = datastore.Entity.FromPb(entity_proto)
+                data = {}
+                table = ds_entity.key().kind()
+                for name, value in list(ds_entity.items()):
+                    if isinstance(value, EmbeddedEntity):
+                        dt: Dict = {}
+                        data[name] = json.dumps(embedded_entity_to_dict(value, dt))
+                        convert_dtype[name] = JSONB 
+                    elif isinstance(value, datastore.Key):
+                        data[name] = {"kind": value.kind(), "id": value.id_or_name()}
+                        convert_dtype[name] = JSONB 
+                    elif isinstance(value, list): 
+                        if len(value) > 0 and isinstance(value[0], datastore.Key):
+                            data[name] = [{"kind": v.kind(), "id": v.id_or_name()} for v in value]
+                            convert_dtype[name] = JSONB
+                        else:
+                            data[name] = value
+                    elif isinstance(value, GeoPt):
+                        data[name] = (value.lat, value.lon)
+                    else:
+                        data[name] = value
+                
+                if ds_entity.parent() is not None:
+                    data["parent"] = {"kind": ds_entity.parent().kind(), "id": ds_entity.parent().id_or_name()}
+                    convert_dtype["parent"] = JSONB
+
+                data["id"] = ds_entity.key().id_or_name()
+                pg_dataframe.append(data)
+    except Exception as e:
+        print(f"Error processing file {in_file}: {str(e)}")
+        return
+
+    if len(pg_dataframe) == 0:
+        print(f"File {in_file} is empty")
+        return
+
+    if write_to_pg:
+        write_to_postgres(conn_str, table, pg_dataframe, convert_dtype)
+    else:
+        out_file_path = os.path.join(dest_dir, filename + ".json")
+        with open(out_file_path, "w", encoding="utf8") as out:
+            out.write(
+                json.dumps(pg_dataframe, default=serialize_json, ensure_ascii=False, indent=2)
+            )
+    
     num_files_processed.value += 1
     if num_files.value > 0:
         print(
             f"progress: {num_files_processed.value}/{num_files.value} {num_files_processed.value/num_files.value*100}%"
         )
 
+def drop_tables(engine):
+    metadata = MetaData()
+    # Reflect existing tables
+    metadata.reflect(bind=engine)
+    # Drop all tables
+    for table_name, table in metadata.tables.items():
+        if table_name in except_table:
+            print(f'Skipping table {table_name}')
+            continue
+        table.drop(engine, checkfirst=False)
+        print(f"Table {table_name} dropped")
+    print("Finished dropping tables")
+
+def concat_curr(engine, table, new_df, convert_dtype):
+    old = pd.read_sql_table(table, engine)
+    new_df = pd.concat([old, new_df], ignore_index=True, verify_integrity=True)
+    try:
+        new_df.to_sql(table, engine, if_exists='replace', index=False, dtype=convert_dtype)
+    except Exception as e:
+        raise e
+
+def write_to_postgres(conn_str, table, json_data, convert_dtype):
+    # Create an engine to connect to the database
+    engine = create_engine(conn_str)
+
+    # Create a Pandas DataFrame
+    df = pd.DataFrame(json_data).convert_dtypes()
+    try:
+        # Insert DataFrame into PostgreSQL table
+        df.to_sql(table, engine, if_exists='append', index=False, dtype=convert_dtype)
+    except Exception as e:
+        try:
+            concat_curr(engine, table, df, convert_dtype)
+        except Exception as e:
+            print(f"Error writing to postgres: {str(e)}", table, convert_dtype)
 
 if __name__ == "__main__":
     main()
