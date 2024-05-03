@@ -5,10 +5,10 @@ import sys
 from functools import partial
 from multiprocessing import Pool, cpu_count, Value
 from pathlib import Path
-from typing import Dict
+import base64
 
 from google.appengine.api import datastore
-from google.appengine.api.datastore_types import EmbeddedEntity, GeoPt
+from google.appengine.api.datastore_types import EmbeddedEntity, GeoPt, Blob, ByteString
 from google.appengine.datastore import entity_bytes_pb2 as entity_pb2
 
 from converter import records
@@ -17,7 +17,7 @@ from converter.utils import embedded_entity_to_dict, serialize_json
 
 import pandas as pd
 from sqlalchemy import create_engine, MetaData
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, BYTEA
 
 num_files: Value = Value("i", 0)
 num_files_processed: Value = Value("i", 0)
@@ -174,20 +174,31 @@ def process_file(source_dir: str, dest_dir: str, no_check_crc: bool, write_to_pg
                 table = ds_entity.key().kind()
                 for name, value in list(ds_entity.items()):
                     if isinstance(value, EmbeddedEntity):
-                        dt: Dict = {}
+                        dt = {}
                         data[name] = json.dumps(embedded_entity_to_dict(value, dt))
                         convert_dtype[name] = JSONB 
                     elif isinstance(value, datastore.Key):
                         data[name] = {"kind": value.kind(), "id": value.id_or_name()}
                         convert_dtype[name] = JSONB 
                     elif isinstance(value, list): 
+                        # is list of datastore key
                         if len(value) > 0 and isinstance(value[0], datastore.Key):
                             data[name] = [{"kind": v.kind(), "id": v.id_or_name()} for v in value]
-                            convert_dtype[name] = JSONB
+                        # is list of datastore entity
+                        elif len(value) > 0 and isinstance(value[0], EmbeddedEntity):
+                            dt = {}
+                            data[name] = [embedded_entity_to_dict(e, dt) for e in value]
+                        # others
                         else:
                             data[name] = value
+                        convert_dtype[name] = JSONB
                     elif isinstance(value, GeoPt):
                         data[name] = (value.lat, value.lon)
+                    elif isinstance(value, Blob):
+                        data[name] = value
+                        convert_dtype[name] = BYTEA
+                    elif isinstance(value, ByteString):
+                        data[name] = base64.b64encode(value).decode('ascii')
                     else:
                         data[name] = value
                 
@@ -233,9 +244,11 @@ def drop_tables(engine):
         print(f"Table {table_name} dropped")
     print("Finished dropping tables")
 
-def concat_curr(engine, table, new_df, convert_dtype):
+def concat_curr(engine, table, concat_df, convert_dtype):
     old = pd.read_sql_table(table, engine)
-    new_df = pd.concat([old, new_df], ignore_index=True, verify_integrity=True)
+    old = old.convert_dtypes()
+    new_df = pd.concat([old, concat_df], ignore_index=True, verify_integrity=True)
+    new_df = new_df.convert_dtypes()
     try:
         new_df.to_sql(table, engine, if_exists='replace', index=False, dtype=convert_dtype)
     except Exception as e:
@@ -250,11 +263,12 @@ def write_to_postgres(conn_str, table, json_data, convert_dtype):
     try:
         # Insert DataFrame into PostgreSQL table
         df.to_sql(table, engine, if_exists='append', index=False, dtype=convert_dtype)
-    except Exception as e:
+    except Exception as err:
         try:
+            df = df.convert_dtypes()
             concat_curr(engine, table, df, convert_dtype)
         except Exception as e:
-            print(f"Error writing to postgres: {str(e)}", table, convert_dtype)
+            print(f"Error writing to postgres: {str(e)}, table:{table}, convert_dtypes: {convert_dtype}")
 
 if __name__ == "__main__":
     main()

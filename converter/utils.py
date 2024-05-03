@@ -46,7 +46,13 @@ def embedded_entity_to_dict(embedded_entity, data):
     ep = entity_pb2.EntityProto()
     ep.ParseFromString(embedded_entity)
     d = MessageToDict(ep)
-    for entry in d.get("rawProperty", []):
+
+    # get by rawProperty or property
+    properties = d.get("rawProperty", [])
+    if len(entry) == 0:
+        entry = d.get("property", [])
+
+    for entry in properties:
         name = entry.get("name")
         value = entry.get("value")
         multiple = entry.get("multiple")
