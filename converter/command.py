@@ -197,8 +197,9 @@ def process_file(source_dir: str, dest_dir: str, no_check_crc: bool, write_to_pg
                     elif isinstance(value, Blob):
                         data[name] = value
                         convert_dtype[name] = BYTEA
-                    elif isinstance(value, ByteString):
-                        data[name] = base64.b64encode(value).decode('ascii')
+                    elif isinstance(value, bytes):
+                        data[name] = value 
+                        convert_dtype[name] = BYTEA
                     else:
                         data[name] = value
                 

@@ -49,8 +49,8 @@ def embedded_entity_to_dict(embedded_entity, data):
 
     # get by rawProperty or property
     properties = d.get("rawProperty", [])
-    if len(entry) == 0:
-        entry = d.get("property", [])
+    if len(properties) == 0:
+        properties = d.get("property", [])
 
     for entry in properties:
         name = entry.get("name")
